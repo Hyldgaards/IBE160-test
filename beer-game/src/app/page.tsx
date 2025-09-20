@@ -1,15 +1,16 @@
 ﻿"use client";
 import { useMemo, useState } from "react";
 
+/** ---------- Typer ---------- */
 type Role = "Retailer" | "Wholesaler" | "Distributor" | "Factory";
 
 interface RoleState {
   onHand: number;
   backlog: number;
-  pipeline: number[]; // incoming shipments til denne rollen
-  leadTime: number;   // 2 for tre første; 3 for Factory
-  policy: "BS";
-  params: { S: number }; // base-stock nivå
+  pipeline: number[];  // innkommende forsendelser til denne rollen
+  leadTime: number;    // 2 for tre første; 3 for Factory (prod + forsendelse)
+  policy: "HUMAN" | "BS" | "RANDOM";
+  params: { S: number }; // brukes av BS (ligger her for fremtidig bruk)
 }
 
 interface WeekRow {
@@ -27,12 +28,15 @@ interface WeekRow {
 interface GameState {
   week: number;
   roles: Record<Role, RoleState>;
-  lastOrders: Record<Role, number>;
-  history: WeekRow[];
+  lastOrders: Record<Role, number>;     // ordrene lagt forrige uke
+  history: WeekRow[];                   // 4 rader per uke
+  random: { mode: "uniform"; a: number; b: number; seed: number }; // robot-tilfeldighet
 }
 
 const ROLES: Role[] = ["Retailer", "Wholesaler", "Distributor", "Factory"];
 
+/** ---------- Hjelpere ---------- */
+// Dyp kopi (for undo)
 function cloneState(s: GameState): GameState {
   return {
     week: s.week,
@@ -44,13 +48,25 @@ function cloneState(s: GameState): GameState {
     },
     lastOrders: { ...s.lastOrders },
     history: [...s.history],
+    random: { ...s.random },
   };
 }
 
-function stepWeek(prev: GameState, externalDemand: number): GameState {
+// Deterministisk PRNG (LCG)
+function lcgNext(seed: number): { u: number; seed: number } {
+  const a = 1664525, c = 1013904223, m = 2 ** 32;
+  const next = (a * seed + c) % m;
+  return { u: next / m, seed: next };
+}
+function randIntUniform(u: number, a: number, b: number): number {
+  return Math.max(a, Math.min(b, Math.floor(a + u * (b - a + 1))));
+}
+
+/** ---------- Spillmotor: ett ukesteg ---------- */
+function stepWeek(prev: GameState, externalDemand: number, retailerOrder: number): GameState {
   const s = cloneState(prev);
 
-  // 1) mottak
+  // 1) Mottak (pipeline -> lager)
   const received: Record<Role, number> = { Retailer:0, Wholesaler:0, Distributor:0, Factory:0 };
   for (const r of ROLES) {
     const role = s.roles[r];
@@ -61,7 +77,7 @@ function stepWeek(prev: GameState, externalDemand: number): GameState {
     role.onHand += recv;
   }
 
-  // 2) demand
+  // 2) Demand denne uken
   const demand: Record<Role, number> = {
     Retailer: externalDemand,
     Wholesaler: s.lastOrders.Retailer || 0,
@@ -69,7 +85,7 @@ function stepWeek(prev: GameState, externalDemand: number): GameState {
     Factory: s.lastOrders.Distributor || 0,
   };
 
-  // 3) ship og oppdater lager/backlog
+  // 3) Skip og oppdater onHand / backlog
   const shipped: Record<Role, number> = { Retailer:0, Wholesaler:0, Distributor:0, Factory:0 };
   for (const r of ROLES) {
     const role = s.roles[r];
@@ -80,18 +96,33 @@ function stepWeek(prev: GameState, externalDemand: number): GameState {
     role.backlog = Math.max(0, need - ship);
   }
 
-  // 4) ordre (BS)
+  // 4) Ordre (HUMAN for Retailer, RANDOM for roboter, ellers BS)
   const orders: Record<Role, number> = { Retailer:0, Wholesaler:0, Distributor:0, Factory:0 };
+  let seed = s.random.seed;
+
   for (const r of ROLES) {
     const role = s.roles[r];
-    const pipelineSum = role.pipeline.reduce((a, b) => a + b, 0);
-    const invPos = role.onHand + pipelineSum - role.backlog;
-    const order = Math.max(0, role.params.S - invPos);
-    orders[r] = Math.round(order);
-    role.pipeline.push(orders[r]); // ankommer etter LT
+    let order = 0;
+
+    if (r === "Retailer" && role.policy === "HUMAN") {
+      order = Math.max(0, Math.round(retailerOrder));
+    } else if (role.policy === "RANDOM" && r !== "Retailer") {
+      const { u, seed: nextSeed } = lcgNext(seed);
+      seed = nextSeed;
+      order = randIntUniform(u, s.random.a, s.random.b);
+    } else {
+      // Base-Stock fallback (ikke brukt for roboter i krav, men nyttig å ha)
+      const pipelineSum = role.pipeline.reduce((a, b) => a + b, 0);
+      const invPos = role.onHand + pipelineSum - role.backlog;
+      order = Math.max(0, role.params.S - invPos);
+      order = Math.round(order);
+    }
+
+    orders[r] = order;
+    role.pipeline.push(order); // ankommer etter role.leadTime
   }
 
-  // 5) logg
+  // 5) Logg 4 rader
   const rows: WeekRow[] = ROLES.map((r) => ({
     week: s.week,
     role: r,
@@ -105,40 +136,49 @@ function stepWeek(prev: GameState, externalDemand: number): GameState {
   }));
   s.history = [...s.history, ...rows];
 
-  // 6) for neste uke
+  // 6) For neste uke
   s.lastOrders = { ...orders };
+  s.random.seed = seed;
   s.week = s.week + 1;
   return s;
 }
 
+/** ---------- React-komponent ---------- */
 export default function Home() {
-  const [customerDemandStr, setCustomerDemandStr] = useState("8");
+  // Scenario-inndata
+  const [customerDemandStr, setCustomerDemandStr] = useState("8");   // Kunde-etterspørsel til Retailer (D)
+  const [retailerOrderStr, setRetailerOrderStr] = useState("0");     // Menneskets ordre hver uke
   const customerDemand = useMemo(
     () => parseInt(customerDemandStr || "0", 10) || 0,
     [customerDemandStr]
   );
 
+  // Initial tilstand (steady state for valgt D)
   const initialState: GameState = useMemo(() => {
-  const D = customerDemand; // steady-state basert på input-feltet
-  return {
-    week: 1,
-    roles: {
-      Retailer:   { onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "BS", params: { S: 2*D } },
-      Wholesaler: { onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "BS", params: { S: 2*D } },
-      Distributor:{ onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "BS", params: { S: 2*D } },
-      Factory:    { onHand: 3*D, backlog: 0, pipeline: [D, D, D],    leadTime: 3, policy: "BS", params: { S: 3*D } },
-    },
-    lastOrders: { Retailer: 0, Wholesaler: 0, Distributor: 0, Factory: 0 },
-    history: [],
-  };
-}, [customerDemand]);
+    const D = customerDemand;
+    return {
+      week: 1,
+      roles: {
+        Retailer:   { onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "HUMAN",  params: { S: 2*D } },
+        Wholesaler: { onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "RANDOM", params: { S: 2*D } },
+        Distributor:{ onHand: 2*D, backlog: 0, pipeline: [D, D],       leadTime: 2, policy: "RANDOM", params: { S: 2*D } },
+        Factory:    { onHand: 3*D, backlog: 0, pipeline: [D, D, D],    leadTime: 3, policy: "RANDOM", params: { S: 3*D } },
+      },
+      lastOrders: { Retailer: 0, Wholesaler: 0, Distributor: 0, Factory: 0 },
+      history: [],
+      random: { mode: "uniform", a: 6, b: 10, seed: 42 },
+    };
+  }, [customerDemand]);
 
   const [state, setState] = useState<GameState>(initialState);
   const [undo, setUndo] = useState<GameState[]>([]);
 
+  // Handlinger
   const handleNextWeek = () => {
+    const retOrder = parseInt(retailerOrderStr || "0", 10) || 0;
     setUndo((u) => [...u, cloneState(state)]);
-    setState((prev) => stepWeek(prev, customerDemand));
+    setState((prev) => stepWeek(prev, customerDemand, retOrder));
+    setRetailerOrderStr("0"); // nullstill for neste uke
   };
 
   const handleUndo = () => {
@@ -155,23 +195,35 @@ export default function Home() {
     setUndo([]);
   };
 
-  const sumPipeline = (r: Role) =>
-    state.roles[r].pipeline.reduce((a, b) => a + b, 0);
+  const sumPipeline = (r: Role) => state.roles[r].pipeline.reduce((a, b) => a + b, 0);
 
+  // UI
   return (
     <main style={{ padding: 20, fontFamily: "system-ui, sans-serif" }}>
       <h1 style={{ fontSize: 28, fontWeight: 700 }}>Beer Game — 1 menneske + 3 roboter</h1>
       <div style={{ marginTop: 4, opacity: 0.8 }}>Uke {state.week}</div>
 
+      {/* Kontrollpanel */}
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12, flexWrap: "wrap" }}>
-        <label htmlFor="cust">Kunde-etterspørsel (Retailer) denne uken</label>
+        <label htmlFor="cust">Kunde-etterspørsel (Retailer, D)</label>
         <input
           id="cust"
           type="number"
           value={customerDemandStr}
           onChange={(e) => setCustomerDemandStr(e.target.value)}
           style={{ padding: 6, width: 120 }}
+          disabled={state.week > 1} // lås etter start for reproduserbarhet
         />
+
+        <label htmlFor="retOrder">Retailer-ordre (manuell)</label>
+        <input
+          id="retOrder"
+          type="number"
+          value={retailerOrderStr}
+          onChange={(e) => setRetailerOrderStr(e.target.value)}
+          style={{ padding: 6, width: 120 }}
+        />
+
         <button onClick={handleNextWeek} style={{ padding: "6px 12px", borderRadius: 6, cursor: "pointer" }}>
           Neste uke
         </button>
@@ -183,6 +235,36 @@ export default function Home() {
         </button>
       </div>
 
+      {/* Random-innstillinger for roboter (låses etter uke 1) */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+        <span style={{ fontWeight: 600 }}>Roboter: Uniform [a,b], seed</span>
+        <label>a</label>
+        <input
+          type="number"
+          value={state.random.a}
+          onChange={(e) => setState({ ...state, random: { ...state.random, a: parseInt(e.target.value || "0", 10) } })}
+          style={{ padding: 6, width: 80 }}
+          disabled={state.week > 1}
+        />
+        <label>b</label>
+        <input
+          type="number"
+          value={state.random.b}
+          onChange={(e) => setState({ ...state, random: { ...state.random, b: parseInt(e.target.value || "0", 10) } })}
+          style={{ padding: 6, width: 80 }}
+          disabled={state.week > 1}
+        />
+        <label>seed</label>
+        <input
+          type="number"
+          value={state.random.seed}
+          onChange={(e) => setState({ ...state, random: { ...state.random, seed: parseInt(e.target.value || "0", 10) } })}
+          style={{ padding: 6, width: 100 }}
+          disabled={state.week > 1}
+        />
+      </div>
+
+      {/* Rolle-kort */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(160px, 1fr))", gap: 10, marginTop: 16 }}>
         {ROLES.map((r) => (
           <div key={r} style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
@@ -195,6 +277,7 @@ export default function Home() {
         ))}
       </div>
 
+      {/* Historikk-tabell */}
       <table style={{ marginTop: 16, borderCollapse: "collapse", minWidth: 920 }}>
         <thead>
           <tr>
